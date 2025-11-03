@@ -454,7 +454,7 @@ public:
                 }
             }
             if (core_id < 0 && p->last_core_id >= 0) {
-                s["core_id"] = to_string(p->last_core_id) + " (last)";
+                s["core_id"] = to_string(p->last_core_id);
             } else if (core_id >= 0) {
                 s["core_id"] = to_string(core_id);
             } else {
