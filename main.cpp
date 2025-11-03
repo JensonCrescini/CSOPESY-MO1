@@ -1,8 +1,23 @@
-// main.cpp
-// CSOPESY OS Emulator - single-file C++ translation of provided Python emulator
-// Compile: g++ -std=c++20 main.cpp -pthread -O2 -o os_emulator
+﻿// Compile: cl /EHsc /std:c++20 /O2 main.cpp
 
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <deque>
+#include <unordered_map>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <optional>
+#include <iomanip>
+#include <cstdio>
+
 using namespace std;
 
 constexpr double TICK_DURATION_SEC = 0.05; // 50 ms per tick
@@ -15,14 +30,14 @@ struct Instr {
     int repeats = 0;    // for FOR
 };
 
-// Utility
+// util
 static unsigned int clamp_uint16(int v) {
     if (v < 0) return 0;
     if (v > (int)UINT16_MAX_VAL) return UINT16_MAX_VAL;
     return (unsigned int)v;
 }
 
-// Forward
+// forward Scheduler
 class Scheduler;
 
 class Process {
@@ -31,7 +46,6 @@ public:
     unsigned long pid;
     string name;
     vector<Instr> instructions;
-    // stack frames: pair of (instr_list pointer, index, repeats)
     struct Frame { vector<Instr>* list_ptr; size_t idx; unsigned int repeats; };
     vector<Frame> pc_stack;
     unordered_map<string,unsigned int> vars;
@@ -42,6 +56,9 @@ public:
     chrono::steady_clock::time_point end_time;
     unsigned long total_cpu_ticks = 0;
     int delays_per_exec = 0; // ticks per instruction busy
+    int current_core_id = -1; // -1 means not assigned to a core
+    int last_core_id = -1;    // Add after current_core_id
+    unsigned long total_instructions = 0; // track total instructions at start
 
     Process(const string& name_, int instr_count, int delays_per_exec_, mt19937 &rng) :
         name(name_), delays_per_exec(delays_per_exec_)
@@ -49,11 +66,17 @@ public:
         pid = ++global_id_counter;
         create_time = chrono::steady_clock::now();
         instructions = generate_instructions(instr_count, rng);
-        // push top frame
+        // calc total instruction count
+        total_instructions = instructions.size();
+        for (auto &instr : instructions) {
+            if (instr.type == "FOR") {
+                total_instructions += instr.body.size() * instr.repeats;
+            }
+        }
         pc_stack.push_back({&instructions, 0, 1});
     }
 
-    // Generate randomized instructions similar to Python version
+    // gen randomized instructions
     vector<Instr> generate_instructions(int n, mt19937 &rng) {
         vector<Instr> ins;
         uniform_real_distribution<> d01(0.0,1.0);
@@ -62,7 +85,6 @@ public:
         uniform_int_distribution<> smallval(0,50);
         uniform_int_distribution<> sleepdur(1,3);
         for (int i=0;i<n;i++) {
-            // Weighted choices: PRINT 0.25, ADD 0.2, SUB 0.15, SLEEP 0.15, DECLARE 0.15, FOR 0.1
             double x = d01(rng);
             if (x < 0.25) {
                 Instr it; it.type="PRINT"; it.args.push_back("Hello world from " + name + "!");
@@ -136,6 +158,13 @@ public:
         return total;
     }
 
+    unsigned long instructions_finished_count() {
+        if (finished) return total_instructions;
+        unsigned long remaining = instructions_remaining_count();
+        if (remaining >= total_instructions) return 0;
+        return total_instructions - remaining;
+    }
+
     // peek next instruction (not advancing)
     optional<Instr> peek_next_instruction() {
         if (finished) return {};
@@ -144,29 +173,21 @@ public:
         if (f.idx >= f.list_ptr->size()) return {};
         return (*f.list_ptr)[f.idx];
     }
-
-    // Execute exactly one logical instruction.
-    // Returns: ticks (positive busy ticks), negative ticks for SLEEP (relinquish), 0 for finished/no-op
-    // outputs: printed messages
     pair<int, vector<string>> step_instruction() {
         vector<string> outputs;
         if (finished) return {0, outputs};
         while (!pc_stack.empty()) {
             Frame &frame = pc_stack.back();
             if (frame.idx >= frame.list_ptr->size()) {
-                // finished frame iteration
                 if (frame.repeats > 1) {
                     frame.repeats -= 1;
                     frame.idx = 0;
-                    // continue with new iteration
                 } else {
-                    // pop frame
                     pc_stack.pop_back();
                 }
                 continue;
             }
             Instr instr = (*frame.list_ptr)[frame.idx];
-            // advance index now
             frame.idx += 1;
             int ticks = max(1, delays_per_exec); // busy ticks at least delays_per_exec
             if (instr.type == "PRINT") {
@@ -211,27 +232,20 @@ public:
             } else if (instr.type == "SLEEP") {
                 int dur = 1;
                 if (instr.args.size()) dur = stoi(instr.args[0]);
-                // return negative to signal relinquish for dur ticks
                 return {-dur, outputs};
             } else if (instr.type == "FOR") {
-                // push body frame
                 if (instr.body.size() > 0 && instr.repeats > 0) {
-                    // We need to store a copy of body in heap so frame can reference it.
-                    // Simplify by storing body vector in a holder owned by this process.
-                    // We'll push body onto instr_frames vector and reference it.
-                    // For simplicity inside single-file: we copy the body into instructions_storage and reference it.
                     instructions_storage.push_back(instr.body);
                     Frame nf;
                     nf.list_ptr = &instructions_storage.back();
                     nf.idx = 0;
                     nf.repeats = instr.repeats;
                     pc_stack.push_back(nf);
-                    // executing FOR itself costs ticks (already set)
                 }
             } else {
                 outputs.push_back("[" + name + "] Unknown instruction " + instr.type);
             }
-            // After execution, check empty stack => finished
+            // etmpy stack = finished
             if (pc_stack.empty()) {
                 finished = true;
                 end_time = chrono::steady_clock::now();
@@ -244,7 +258,6 @@ public:
         return {0, {}};
     }
 
-    // SMI summary (similar to Python)
     struct SmiSummary {
         string name;
         unsigned long pid;
@@ -269,13 +282,12 @@ public:
     }
 
 private:
-    // storage for dynamically added FOR bodies
     vector<vector<Instr>> instructions_storage;
 };
 
 atomic<unsigned long> Process::global_id_counter(0);
 
-// Scheduler
+// scheduler
 class Scheduler {
 public:
     Scheduler(const string& config_path) : rng(random_device{}()) {
@@ -308,23 +320,12 @@ public:
 
     // config.txt parser (space-separated key value)
     void load_config(const string& path) {
-        // set defaults
         config_num_cpu = stoi(DEFAULT_CONFIG.at("num-cpu"));
         config_scheduler = DEFAULT_CONFIG.at("scheduler");
         config_quantum = stoi(DEFAULT_CONFIG.at("quantum-cycles"));
         config_batch_freq = stoi(DEFAULT_CONFIG.at("batch-process-freq"));
         config_min_ins = stoi(DEFAULT_CONFIG.at("min-ins"));
         config_max_ins = stoi(DEFAULT_CONFIG.at("max-ins"));
-        config_delays = stoi(DEFAULT_CONFIG.at("delays-per-exec"));
-
-        ifstream f(path);
-        if (!f) {
-            cout << "[initialize] Warning: " << path << " not found. Using defaults.\n";
-        } else {
-            string key, val;
-            while (f >> key >> val) {
-                if (key == "num-cpu") config_num_cpu = stoi(val);
-                else if (key == "scheduler") {
                     config_scheduler = val;
                     for (auto &c: config_scheduler) c = tolower(c);
                 }
@@ -337,18 +338,14 @@ public:
         }
         if (config_num_cpu < 1) config_num_cpu = 1;
         if (config_num_cpu > 128) config_num_cpu = 128;
-        // resize structures possibly used before constructing threads
-        // (we set cores/core_busy_ticks later)
     }
 
-    // start ticker thread
     void start_ticker() {
         if (ticker_running) return;
         ticker_running = true;
         ticker_thread = thread(&Scheduler::_ticker_loop, this);
     }
 
-    // proc generation
     void start_batch_generation() {
         lock_guard<mutex> lg(mu);
         if (proc_gen_running) {
@@ -374,7 +371,6 @@ public:
         cout << "scheduler-stop: batch generation stopped.\n";
     }
 
-    // list processes (returns copy vectors)
     pair<vector<shared_ptr<Process>>, vector<shared_ptr<Process>>> list_processes() {
         lock_guard<mutex> lg(mu);
         vector<shared_ptr<Process>> running;
@@ -389,11 +385,9 @@ public:
         lock_guard<mutex> lg(mu);
         for (auto &p : ready_queue) if (p->name == name && !p->finished) return p;
         for (auto &kv : running_procs) if (kv.second->name == name && !kv.second->finished) return kv.second;
-        // per spec: finished should not be accessible via -r
         return nullptr;
     }
 
-    // generate utilization report and write csopesy-log.txt
     struct UtilReport {
         double utilization_pct;
         int cores_used;
@@ -403,7 +397,7 @@ public:
         vector<unordered_map<string,string>> per_process;
     };
 
-    UtilReport generate_util_report() {
+    UtilReport generate_util_report_internal() {
         lock_guard<mutex> lg(mu);
         unsigned long total_time_ticks = max<unsigned long>(1, total_ticks);
         unsigned long total_core_ticks = 0;
@@ -419,7 +413,6 @@ public:
         vector<string> finished_names;
         for (auto &kv : finished_procs) finished_names.push_back(kv.second->name);
 
-        // per process summary
         unordered_map<unsigned long, shared_ptr<Process>> all_known;
         for (auto &p : ready_queue) all_known[p->pid] = p;
         for (auto &kv : running_procs) all_known[kv.first] = kv.second;
@@ -434,30 +427,54 @@ public:
             s["status"] = p->finished ? "Finished" : "Running";
             s["instr_left"] = to_string(p->instructions_remaining_count());
             s["total_cpu_ticks"] = to_string(p->total_cpu_ticks);
+            
+            auto now = chrono::system_clock::now();
+            time_t now_c = chrono::system_clock::to_time_t(now);
+            tm local_tm;
+#ifdef _WIN32
+            localtime_s(&local_tm, &now_c);
+#else
+            localtime_r(&now_c, &local_tm);
+#endif
+            char timestamp[32];
+            int hour = local_tm.tm_hour;
+            const char* ampm = (hour >= 12) ? "PM" : "AM";
+            if (hour > 12) hour -= 12;
+            if (hour == 0) hour = 12;
+            snprintf(timestamp, sizeof(timestamp), "%02d/%02d/%04d %02d:%02d:%02d %s",
+                     local_tm.tm_mon + 1, local_tm.tm_mday, local_tm.tm_year + 1900,
+                     hour, local_tm.tm_min, local_tm.tm_sec, ampm);
+            s["timestamp"] = timestamp;
+            
+            int core_id = -1;
+            for (size_t i = 0; i < cores.size(); ++i) {
+                if (cores[i] == p->pid) {
+                    core_id = (int)i;
+                    break;
+                }
+            }
+            if (core_id < 0 && p->last_core_id >= 0) {
+                s["core_id"] = to_string(p->last_core_id) + " (last)";
+            } else if (core_id >= 0) {
+                s["core_id"] = to_string(core_id);
+            } else {
+                if (p->total_cpu_ticks > 0) {
+                    cerr << "[BUG] Process " << p->name 
+                         << " (pid " << p->pid << ") "
+                         << "has executed " << p->instructions_finished_count() 
+                         << " instructions and " << p->total_cpu_ticks << " CPU ticks "
+                         << "but last_core_id=" << p->last_core_id << "\n";
+                }
+                s["core_id"] = "N/A";
+            }
+            
+            unsigned long finished = p->instructions_finished_count();
+            unsigned long total = p->total_instructions;
+            s["instr_finished"] = to_string(finished);
+            s["instr_total"] = to_string(total);
+            
             per_proc_summary.push_back(s);
         }
-
-        // write to csopesy-log.txt
-        ofstream out("csopesy-log.txt");
-        out << "=== CSOPESY CPU UTILIZATION REPORT ===\n";
-        out << "Timestamp: " << chrono::system_clock::to_time_t(chrono::system_clock::now()) << "\n";
-        out << "Total ticks elapsed: " << total_time_ticks << "\n";
-        out << "CPU cores configured: " << config_num_cpu << "\n";
-        out << fixed << setprecision(2);
-        out << "CPU utilization: " << utilization_pct << "% (" << total_core_ticks << " busy ticks of " << max_possible_ticks << " possible)\n";
-        out << "Cores used (now): " << cores_used << "\n";
-        out << "Cores available (now): " << cores_available << "\n\n";
-        out << "Running processes:\n";
-        for (auto &r : running_names) out << " - " << r << "\n";
-        out << "\nFinished processes:\n";
-        for (auto &f : finished_names) out << " - " << f << "\n";
-        out << "\nPer-process summary:\n";
-        for (auto &s : per_proc_summary) {
-            out << " - " << s.at("name") << " (pid " << s.at("pid") << "): " << s.at("status")
-                << ", instr_left=" << s.at("instr_left") << ", cpu_ticks=" << s.at("total_cpu_ticks") << "\n";
-        }
-        out.close();
-        cout << "report-util: csopesy-log.txt generated.\n";
 
         UtilReport rep;
         rep.utilization_pct = utilization_pct;
@@ -469,6 +486,69 @@ public:
         return rep;
     }
 
+    UtilReport generate_util_report() {
+        auto rep = generate_util_report_internal();
+        
+        ofstream out("csopesy-log.txt");
+        out << "=== CSOPESY CPU UTILIZATION REPORT ===\n";
+        
+        auto now = chrono::system_clock::now();
+        time_t now_c = chrono::system_clock::to_time_t(now);
+        tm local_tm;
+#ifdef _WIN32
+        localtime_s(&local_tm, &now_c);
+#else
+        localtime_r(&now_c, &local_tm);
+#endif
+        int hour = local_tm.tm_hour;
+        const char* ampm = (hour >= 12) ? "PM" : "AM";
+        if (hour > 12) hour -= 12;
+        if (hour == 0) hour = 12;
+        
+        out << "Timestamp: " << setfill('0') << setw(2) << (local_tm.tm_mon + 1) << "/"
+            << setw(2) << local_tm.tm_mday << "/" << (local_tm.tm_year + 1900)
+            << " " << setw(2) << hour << ":" << setw(2) << local_tm.tm_min
+            << ":" << setw(2) << local_tm.tm_sec << " " << ampm << "\n";
+        
+        lock_guard<mutex> lg(mu);
+        out << "Total ticks elapsed: " << total_ticks << "\n";
+        out << "CPU cores configured: " << config_num_cpu << "\n";
+        out << fixed << setprecision(2);
+        out << "CPU utilization: " << rep.utilization_pct << "%\n";
+        out << "Cores used (now): " << rep.cores_used << "\n";
+        out << "Cores available (now): " << rep.cores_available << "\n\n";
+        
+        out << "Running processes:\n";
+        for (auto &s : rep.per_process) {
+            if (s.at("status") == "Running") {
+                out << " - " << s.at("name") << " (pid " << s.at("pid") << ") "
+                    << "(" << s.at("timestamp") << ") "
+                    << "Core: " << s.at("core_id") << " "
+                    << s.at("instr_finished") << "/" << s.at("instr_total") << "\n";
+            }
+        }
+        
+        out << "\nFinished processes:\n";
+        for (auto &s : rep.per_process) {
+            if (s.at("status") == "Finished") {
+                out << " - " << s.at("name") << " (pid " << s.at("pid") << ") "
+                    << "(" << s.at("timestamp") << ") "
+                    << "Core: " << s.at("core_id") << " "
+                    << s.at("instr_finished") << "/" << s.at("instr_total") << "\n";
+            }
+        }
+        
+        out << "\nPer-process summary:\n";
+        for (auto &s : rep.per_process) {
+            out << " - " << s.at("name") << " (pid " << s.at("pid") << "): " << s.at("status")
+                << ", instr_left=" << s.at("instr_left") << ", cpu_ticks=" << s.at("total_cpu_ticks") << "\n";
+        }
+        out.close();
+        cout << "report-util: csopesy-log.txt generated.\n";
+
+        return rep;
+    }
+
     void shutdown() {
         {
             lock_guard<mutex> lg(mu);
@@ -476,13 +556,10 @@ public:
             proc_gen_running = false;
             ticker_running = false;
         }
-        // notify threads (workers check flag)
         if (proc_gen_thread.joinable()) proc_gen_thread.join();
-        // workers joined in destructor
         cout << "Shutting down scheduler...\n";
     }
 
-    // Create a process and push to ready queue (used by screen -s)
     shared_ptr<Process> create_process_with_name(const string& pname) {
         lock_guard<mutex> lg(mu);
         int ins = uniform_int_distribution<int>(config_min_ins, config_max_ins)(rng);
@@ -492,7 +569,6 @@ public:
     }
 
 private:
-    // Default config
     const unordered_map<string,string> DEFAULT_CONFIG {
         {"num-cpu","2"},
         {"scheduler","fcfs"},
@@ -503,24 +579,21 @@ private:
         {"delays-per-exec","0"}
     };
 
-    // Configs
     int config_num_cpu = 2;
-    string config_scheduler = "fcfs"; // fcfs or rr
+    string config_scheduler = "fcfs";
     int config_quantum = 3;
     int config_batch_freq = 5;
     int config_min_ins = 3;
     int config_max_ins = 8;
     int config_delays = 0;
 
-    // runtime state
     deque<shared_ptr<Process>> ready_queue;
     unordered_map<unsigned long, shared_ptr<Process>> running_procs;
     unordered_map<unsigned long, shared_ptr<Process>> finished_procs;
 
-    vector<unsigned long> cores; // pid assigned or 0
+    vector<unsigned long> cores;
     vector<unsigned long> core_busy_ticks;
 
-    // synchronization
     mutex mu;
 
     vector<thread> worker_threads;
@@ -531,15 +604,11 @@ private:
     bool shutdown_flag;
     unsigned long total_ticks = 0;
 
-    // for rng and process generation
     mt19937 rng;
 
-    // worker helpers
-    vector<unsigned long> core_busy_ticks_snapshot; // unused
+    vector<unsigned long> core_busy_ticks_snapshot;
 
-    // worker loop
     void cpu_worker_loop(int core_id) {
-        // each worker repeatedly tries to fetch process and run according to scheduling
         while (true) {
             {
                 lock_guard<mutex> lg(mu);
@@ -552,7 +621,14 @@ private:
                     proc = ready_queue.front();
                     ready_queue.pop_front();
                     running_procs[proc->pid] = proc;
-                    if ((int)cores.size() > core_id) cores[core_id] = proc->pid;
+                    if ((int)cores.size() > core_id) {
+                        cores[core_id] = proc->pid;
+                        proc->current_core_id = core_id; 
+                        proc->last_core_id = core_id;
+                    } else {
+                        cerr << "[ERROR] Core vector size mismatch! cores.size()=" 
+                             << cores.size() << " core_id=" << core_id << "\n";
+                    }
                 } else {
                     if ((int)cores.size() > core_id) cores[core_id] = 0;
                 }
@@ -564,6 +640,10 @@ private:
             if (proc->start_time.time_since_epoch().count() == 0) proc->start_time = chrono::steady_clock::now();
 
             if (config_scheduler == "fcfs") {
+                if (proc->last_core_id == -1) {
+                    proc->last_core_id = core_id;
+                }
+                
                 while (!proc->finished) {
                     {
                         lock_guard<mutex> lg(mu);
@@ -578,33 +658,38 @@ private:
                             if (cores.size() > (size_t)core_id) cores[core_id] = 0;
                             running_procs.erase(proc->pid);
                         }
-                        // sleep real time without busy counting
                         this_thread::sleep_for(chrono::duration<double>(sleep_ticks * TICK_DURATION_SEC));
                         {
                             lock_guard<mutex> lg(mu);
-                            if (!proc->finished) ready_queue.push_back(proc);
+                            if (!proc->finished) {
+                                ready_queue.push_back(proc);
+                            }
                         }
                         break;
                     }
-                    // busy-wait simulation: occupy core for 'ticks' ticks and increment counters
+                    // busy-wait simulation: occupy core for instruction execution
                     for (int tt=0; tt<ticks; ++tt) {
                         {
                             lock_guard<mutex> lg(mu);
                             core_busy_ticks[core_id] += 1;
                             proc->total_cpu_ticks += 1;
+                            proc->last_core_id = core_id;
                         }
                         this_thread::sleep_for(chrono::duration<double>(TICK_DURATION_SEC));
                     }
                     for (auto &ln : outputs) proc->logs.push_back(ln);
                 }
-                // move to finished if done
                 if (proc->finished) {
                     lock_guard<mutex> lg(mu);
                     if (cores.size() > (size_t)core_id) cores[core_id] = 0;
                     running_procs.erase(proc->pid);
                     finished_procs[proc->pid] = proc;
                 }
-            } else { // round robin
+            } else {
+                if (proc->last_core_id == -1) {
+                    proc->last_core_id = core_id;
+                }
+    
                 int remaining_quantum = config_quantum;
                 bool preempted = false;
                 while (!proc->finished && remaining_quantum > 0) {
@@ -624,7 +709,9 @@ private:
                         this_thread::sleep_for(chrono::duration<double>(sleep_ticks * TICK_DURATION_SEC));
                         {
                             lock_guard<mutex> lg(mu);
-                            if (!proc->finished) ready_queue.push_back(proc);
+                            if (!proc->finished) {
+                                ready_queue.push_back(proc);
+                            }
                         }
                         preempted = true;
                         break;
@@ -636,18 +723,20 @@ private:
                             core_busy_ticks[core_id] += 1;
                             proc->total_cpu_ticks += 1;
                             remaining_quantum -= 1;
+                            proc->last_core_id = core_id; 
                         }
                         this_thread::sleep_for(chrono::duration<double>(TICK_DURATION_SEC));
                     }
+                    // process exhausted quantum mid-instruction: requeue with partial state
                     if (ticks > ticks_to_consume) {
-                        // treat as partially executed: requeue at front to resume soon
                         lock_guard<mutex> lg(mu);
                         ready_queue.push_front(proc);
                         preempted = true;
                         break;
                     }
                     for (auto &ln : outputs) proc->logs.push_back(ln);
-                } // end rr while
+                }
+    
                 if (proc->finished) {
                     lock_guard<mutex> lg(mu);
                     if (cores.size() > (size_t)core_id) cores[core_id] = 0;
@@ -660,10 +749,9 @@ private:
                     ready_queue.push_back(proc);
                 }
             }
-        } // outer while
+        }
     }
 
-    // ticker increments total_ticks at TICK_DURATION
     void _ticker_loop() {
         while (true) {
             {
@@ -677,7 +765,6 @@ private:
         }
     }
 
-    // batch generation
     void _proc_gen_loop() {
         int counter = 1;
         long long last_tick = -1;
@@ -694,7 +781,6 @@ private:
                 unsigned long current_tick = total_ticks;
                 if (last_tick == -1) last_tick = (long long)current_tick;
                 if ((long long)(current_tick - last_tick) >= config_batch_freq) {
-                    // create process
                     char buf[32];
                     snprintf(buf, sizeof(buf), "p%03d", counter);
                     int ins = uniform_int_distribution<int>(config_min_ins, config_max_ins)(rng);
@@ -708,7 +794,6 @@ private:
     }
 };
 
-// Screen Manager / CLI wrapper
 class ScreenManager {
 public:
     ScreenManager(Scheduler* s) : sched(s) {}
@@ -729,25 +814,36 @@ public:
                 cout << "Process " << name << " already exists (running or finished). Choose another name.\n";
                 return;
             }
-            // create and append to ready queue
             auto p = sched->create_process_with_name(name);
             cout << "Created and attached to process " << name << ".\n";
             _process_screen_loop(name);
         } else if (flag == "-ls") {
             auto [running, finished] = sched->list_processes();
+            auto report = sched->generate_util_report_internal();
             cout << "=== screen -ls ===\n";
-            // cores used and available
-            {
-                // We don't have direct public cores, so emulate by calling report (cheap)
-            }
-            // print running
+            cout << fixed << setprecision(2);
+            cout << "CPU utilization: " << report.utilization_pct << "%\n";
+            cout << "Cores used: " << report.cores_used << "\n";
+            cout << "Cores available: " << report.cores_available << "\n";
+            
             cout << "\nRunning processes:\n";
-            for (auto &p : running) {
-                cout << " - " << p->name << " (pid " << p->pid << ") " << (p->finished ? "[Finished]" : "") << "\n";
+            for (auto &s : report.per_process) {
+                if (s.at("status") == "Running") {
+                    cout << " - " << s.at("name") << " (pid " << s.at("pid") << ") "
+                         << "(" << s.at("timestamp") << ") "
+                         << "Core: " << s.at("core_id") << " "
+                         << s.at("instr_finished") << "/" << s.at("instr_total") << "\n";
+                }
             }
+            
             cout << "\nFinished processes:\n";
-            for (auto &p : finished) {
-                cout << " - " << p->name << " (pid " << p->pid << ")\n";
+            for (auto &s : report.per_process) {
+                if (s.at("status") == "Finished") {
+                    cout << " - " << s.at("name") << " (pid " << s.at("pid") << ") "
+                         << "(" << s.at("timestamp") << ") "
+                         << "Core: " << s.at("core_id") << " "
+                         << s.at("instr_finished") << "/" << s.at("instr_total") << "\n";
+                }
             }
         } else if (flag == "-r") {
             if (tokens.size() != 3) {
@@ -790,18 +886,14 @@ private:
                 cout << "Detaching and returning to main menu.\n";
                 break;
             } else if (cmd == "process-smi") {
-                // find process in ready/running/finished
                 shared_ptr<Process> proc = nullptr;
                 {
                     auto [running, finished] = sched->list_processes();
                     for (auto &p : running) if (p->name == name) { proc = p; break; }
                     if (!proc) {
-                        // check running procs via find_proc_by_name (only checks ready+running)
                         proc = sched->find_proc_by_name(name);
                     }
                     if (!proc) {
-                        // check finished by generating report and scanning file list (inelegant)
-                        // But Scheduler::list_processes returns finished processes too, so we retrieved finished earlier
                         for (auto &p : finished) if (p->name == name) { proc = p; break; }
                     }
                 }
@@ -828,8 +920,6 @@ private:
     }
 };
 
-
-// Main CLI
 void print_help() {
     cout << R"(
 Available commands:
@@ -853,7 +943,7 @@ int main() {
     ScreenManager* screen_manager = nullptr;
     bool initialized = false;
 
-    cout << "Welcome to CSOPESY OS Emulator (C++). Type 'help' for commands.\n";
+    cout << "Welcome to CSOPESY OS Emulator. Type 'help' for commands.\n";
     try {
         while (true) {
             cout << "> " << flush;
@@ -862,12 +952,10 @@ int main() {
                 cout << "\nExiting console.\n";
                 break;
             }
-            // trim
             auto ltrim = [](string &s){ s.erase(s.begin(), find_if(s.begin(), s.end(), [](int ch){ return !isspace(ch); })); };
             auto rtrim = [](string &s){ s.erase(find_if(s.rbegin(), s.rend(), [](int ch){ return !isspace(ch); }).base(), s.end()); };
             ltrim(line); rtrim(line);
             if (line.empty()) continue;
-            // split tokens
             vector<string> tokens;
             {
                 istringstream iss(line);
@@ -900,8 +988,6 @@ int main() {
                     screen_manager = new ScreenManager(scheduler);
                     initialized = true;
                     cout << "initialize: configuration loaded and scheduler started.\n";
-                    // Print config summary by re-reading file (Scheduler holds defaults only private)
-                    // For simplicity, print minimal info: num-cpu unknown externally, we assume 2 default
                     cout << " - Scheduler started. Use 'screen -ls' and other commands now.\n";
                 } catch (const exception &e) {
                     cout << "Error during initialize: " << e.what() << "\n";
