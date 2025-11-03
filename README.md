@@ -1,19 +1,19 @@
-#CSOPESY OS Emulator
+CSOPESY OS Emulator
 
-###Project Members:
+Project Members:
     Apetreor, Lee Jacob Marcus
     Leander, Wendel Walter
     David, Joanna Isabelle
     Crescini, Nick Jenson
 
-##COMPILATION INSTRUCTIONS
+COMPILATION INSTRUCTIONS
 
 To compile the emulator, use:
     g++ -std=c++20 main.cpp -pthread -O2 -o main.exe
 To run the emulator, use:
     .\main.exe
 
-###Commands:
+Commands:
  - initialize           : load config.txt and start scheduler (required before other commands except exit)
  - exit                 : terminate console
  - screen -s <name>     : create new process and attach screen
